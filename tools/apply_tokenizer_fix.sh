@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Build a corrected tokenizer directory for the azampatti INT4 checkpoint (upstream issue #2).
 #
 # The hub tokenizer.json carries a pre-tokenizer regex WITHOUT \p{M} (a transformers v5 bug, #49066, wrote it back
