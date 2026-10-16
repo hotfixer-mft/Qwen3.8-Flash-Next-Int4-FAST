@@ -12,6 +12,8 @@ MODEL_REPO="${MODEL_REPO:-azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound}"
 SERVED_NAME="${SERVED_NAME:-qwen3.8-flash-next-a5b}"  # the name clients send as "model"
 PORT="${PORT:-8000}"                                  # host port for the OpenAI-compatible API
 API_KEY_FILE="${API_KEY_FILE:-}"                      # file with one Bearer key per line, # = comment; empty = no auth
+TOKENIZER_DIR="${TOKENIZER_DIR:-}"                    # dir with a corrected tokenizer.json (build it with tools/apply_tokenizer_fix.sh); empty = the model's own tokenizer
+PROMPT_TOKENS_DETAILS="${PROMPT_TOKENS_DETAILS:-0}"   # 1 = expose usage.prompt_tokens_details (prefix-cache hits) in API responses
 BACKEND="${BACKEND:-auto}"                            # auto = what setup.sh set up (b12x when it found Eugr's spark-vllm-docker) | b12x | classic (our image). b12x runs the solo recipe: only PORT CTX SEQS KV_BYTES SERVED_NAME CONTAINER EXTRA_ARGS apply, the recipe sets the rest (MTP 5, draft x2, medium)
 
 CTX="${CTX:-262144}"                                  # max tokens in ONE request (prompt + output)
@@ -62,6 +64,14 @@ if [ -n "$API_KEY_FILE" ]; then
   [ "${#API_KEYS[@]}" -gt 0 ] && { AUTH=(--api-key "${API_KEYS[@]}"); AUTH_NOTE=", auth: ${#API_KEYS[@]} key(s)"; }
 fi
 
+TOK=(); TOK_NOTE=""
+if [ -n "$TOKENIZER_DIR" ]; then
+  [ -f "$TOKENIZER_DIR/tokenizer.json" ] || { echo "TOKENIZER_DIR '$TOKENIZER_DIR' has no tokenizer.json -- build it with tools/apply_tokenizer_fix.sh, or set TOKENIZER_DIR= to use the model's own tokenizer" >&2; exit 1; }
+  TOK=(--tokenizer "$TOKENIZER_DIR"); TOK_NOTE=", tokenizer: $TOKENIZER_DIR"
+fi
+PTD=(); PTD_NOTE=""
+[ "$PROMPT_TOKENS_DETAILS" = 1 ] && { PTD=(--enable-prompt-tokens-details); PTD_NOTE=", prompt-details: on"; }
+
 # b12x: Eugr's spark-vllm-docker launches it, with the recipe + mod setup.sh (eugr-setup.sh) installed there. The mod checks
 # the model, builds the draft folder and patches vLLM inside the container, so none of the classic steps below apply.
 [ "$BACKEND" = auto ] && BACKEND="${SETUP_BACKEND:-classic}"
@@ -72,12 +82,12 @@ if [ "$BACKEND" = b12x ]; then
   docker image inspect "$B12X_IMAGE" >/dev/null 2>&1 || { echo "Image $B12X_IMAGE not found -- run ./setup.sh" >&2; exit 1; }
   [ "$DOWNLOAD_MODE" = cache ] || { echo "The b12x recipe reads the model from the Hugging Face cache (DOWNLOAD_MODE=cache)" >&2; exit 1; }
   B12X=(--solo -t "$B12X_IMAGE" --port "$PORT" --max-model-len "$CTX" --name "$CONTAINER"); [ "$DETACH" = 1 ] && B12X+=(-d)
-  echo "Serving $MODEL_REPO with Eugr's b12x stack ($B12X_IMAGE, recipe $B12X_RECIPE) -- ${CTX} ctx, KV $KV_BYTES on port $PORT${AUTH_NOTE}"
+  echo "Serving $MODEL_REPO with Eugr's b12x stack ($B12X_IMAGE, recipe $B12X_RECIPE) -- ${CTX} ctx, KV $KV_BYTES on port $PORT${AUTH_NOTE}${TOK_NOTE}${PTD_NOTE}"
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   cd "$EUGR_DIR"
   # Arguments after -- are appended to the recipe's vllm command; vLLM keeps the last value of a repeated flag.
   HF_HOME="$HF_HOME" exec ./run-recipe.sh "$RECIPE" "${B12X[@]}" -- \
-    --served-model-name "$SERVED_NAME" --max-num-seqs "$SEQS" --kv-cache-memory-bytes "$KV_BYTES" $EXTRA_ARGS "${AUTH[@]}"
+    --served-model-name "$SERVED_NAME" --max-num-seqs "$SEQS" --kv-cache-memory-bytes "$KV_BYTES" "${TOK[@]}" "${PTD[@]}" $EXTRA_ARGS "${AUTH[@]}"
 fi
 [ "$BACKEND" = classic ] || { echo "BACKEND must be auto, b12x or classic (got '$BACKEND')" >&2; exit 1; }
 
@@ -150,7 +160,7 @@ RUN=(--rm); [ "$DETACH" = 1 ] && RUN=(-d --rm) || { [ -t 0 ] && RUN=(--rm -it); 
 # PLE table gathers are a CPU op + a host-to-device copy, so they must run outside CUDA graphs.
 SPLIT='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]'
 
-echo "Serving $MODEL_REPO -- top-k $TOPK, ${CTX} ctx, MTP ${MTP}${DRAFT_NOTE}$([ "$REJECTION_SAMPLE" != standard ] && echo " $REJECTION_SAMPLE-verify")$([ "$DRAFT_SAMPLE" != greedy ] && echo " $DRAFT_SAMPLE-draft")$SCALE_NOTE, KV $KV_BYTES $KV_DTYPE$TPL_NOTE$([ "$DET_TOPK" = 1 ] && echo ', deterministic top-k') on port $PORT${AUTH_NOTE}"
+echo "Serving $MODEL_REPO -- top-k $TOPK, ${CTX} ctx, MTP ${MTP}${DRAFT_NOTE}$([ "$REJECTION_SAMPLE" != standard ] && echo " $REJECTION_SAMPLE-verify")$([ "$DRAFT_SAMPLE" != greedy ] && echo " $DRAFT_SAMPLE-draft")$SCALE_NOTE, KV $KV_BYTES $KV_DTYPE$TPL_NOTE$([ "$DET_TOPK" = 1 ] && echo ', deterministic top-k') on port $PORT${AUTH_NOTE}${TOK_NOTE}${PTD_NOTE}"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 exec docker run "${RUN[@]}" --name "$CONTAINER" \
   --gpus all --ipc=host --shm-size "$SHM" -p "${PORT}:8000" \
@@ -164,4 +174,4 @@ exec docker run "${RUN[@]}" --name "$CONTAINER" \
     -cc.cudagraph_mode=PIECEWISE -cc.splitting_ops="$SPLIT" --no-enable-flashinfer-autotune \
     --kv-cache-dtype "$KV_DTYPE" \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" --reasoning-parser "$REASONING_PARSER" \
-    "${TPL[@]}" "${SPEC[@]}" $EXTRA_ARGS "${AUTH[@]}"
+    "${TPL[@]}" "${SPEC[@]}" "${TOK[@]}" "${PTD[@]}" $EXTRA_ARGS "${AUTH[@]}"
